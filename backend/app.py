@@ -37,10 +37,8 @@ def get_supabase(creds):
 def health():
     return jsonify({'status': 'ok'})
 
-# ─── Root ───────────────────────────────────────────
-@app.route('/')
-def root():
-    return "TeleGallery Backend Running 🚀"
+
+
 
 
 # ─── Test Connections ─────────────────────────────────
@@ -96,30 +94,45 @@ def upload_file():
         else:
             file_type = 'photo'
 
-        # Upload to Telegram
+        # ALWAYS upload as document to preserve original quality (no compression)
         result = uploader.send_file(
             chat_id=creds['channel_id'],
             file_path=tmp.name,
-            file_type=file_type,
+            file_type='document',
         )
 
-        # Extract file_id
-        if file_type == 'video':
-            tg_file = result.get('video', {})
-            thumbnail_id = result.get('video', {}).get('thumb', {}).get('file_id', '') if result.get('video', {}).get('thumb') else ''
-            width = tg_file.get('width', 0)
-            height = tg_file.get('height', 0)
-            duration = tg_file.get('duration', 0)
-        else:
-            # Photos come as array, take largest
-            photos = result.get('photo', [])
-            tg_file = photos[-1] if photos else {}
-            thumbnail_id = photos[0].get('file_id', '') if len(photos) > 1 else ''
-            width = tg_file.get('width', 0)
-            height = tg_file.get('height', 0)
-            duration = 0
+        # Extract file_id from document
+        tg_doc = result.get('document', {})
+        file_id = tg_doc.get('file_id', '')
+        thumbnail_id = ''
+        width = 0
+        height = 0
+        duration = 0
 
-        file_id = tg_file.get('file_id', '')
+        # For photos, also send as photo to get a compressed thumbnail
+        if file_type == 'photo':
+            try:
+                thumb_result = uploader.send_file(
+                    chat_id=creds['channel_id'],
+                    file_path=tmp.name,
+                    file_type='photo',
+                )
+                photos = thumb_result.get('photo', [])
+                if photos:
+                    # Smallest size = thumbnail
+                    thumbnail_id = photos[0].get('file_id', '')
+                    # Largest size for dimensions
+                    largest = photos[-1]
+                    width = largest.get('width', 0)
+                    height = largest.get('height', 0)
+            except Exception:
+                pass  # Thumbnail is optional
+
+        # For videos, get metadata from document thumb
+        if file_type == 'video':
+            thumb = tg_doc.get('thumb') or tg_doc.get('thumbnail')
+            if thumb:
+                thumbnail_id = thumb.get('file_id', '')
 
         # Save to Supabase
         sb = get_supabase(creds)
