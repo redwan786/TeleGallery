@@ -37,6 +37,11 @@ def get_supabase(creds):
 def health():
     return jsonify({'status': 'ok'})
 
+# ─── Root ───────────────────────────────────────────
+@app.route('/')
+def root():
+    return "TeleGallery Backend Running 🚀"
+
 
 # ─── Test Connections ─────────────────────────────────
 @app.route('/api/setup/test', methods=['POST'])
