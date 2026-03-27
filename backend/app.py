@@ -38,7 +38,10 @@ def health():
     return jsonify({'status': 'ok'})
 
 
-
+# ─── Root ───────────────────────────────────────────
+@app.route('/')
+def root():
+    return "TeleGallery Backend Running 🚀"
 
 
 # ─── Test Connections ─────────────────────────────────
