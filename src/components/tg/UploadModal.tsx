@@ -1,7 +1,9 @@
 import { X, Upload, FileImage, FileVideo, CheckCircle2, AlertCircle } from 'lucide-react';
 import { useState, useRef, useCallback } from 'react';
 import { useConfig } from '@/context/ConfigContext';
-import { getApi } from '@/lib/api';
+import { getApi, getApiHeaders } from '@/lib/api';
+
+const MAX_BOT_API_SIZE = 50 * 1024 * 1024; // 50 MB
 
 interface UploadFile {
   file: File;
@@ -30,23 +32,89 @@ export default function UploadModal({ onClose, onUploaded }: { onClose: () => vo
     addFiles(e.dataTransfer.files);
   }, [addFiles]);
 
+  const uploadSmallFile = async (file: File, index: number) => {
+    const api = getApi(credentials);
+    const form = new FormData();
+    form.append('file', file);
+    await api.post('/api/upload', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (e) => {
+        const pct = Math.round((e.loaded * 100) / (e.total || 1));
+        setFiles(prev => prev.map((f, j) => j === index ? { ...f, progress: pct } : f));
+      },
+    });
+  };
+
+  const uploadLargeFile = (file: File, index: number): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const form = new FormData();
+      form.append('file', file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${credentials.backendUrl}/api/upload/large`);
+
+      // Set auth headers
+      const headers = getApiHeaders(credentials);
+      Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+
+      // Track upload progress (sending to server)
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          // Upload to server is first 50%, Telegram upload is next 50%
+          const pct = Math.round((e.loaded * 50) / e.total);
+          setFiles(prev => prev.map((f, j) => j === index ? { ...f, progress: pct } : f));
+        }
+      };
+
+      // Process SSE response for Telegram upload progress
+      let buffer = '';
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState >= 3 && xhr.responseText) {
+          const newData = xhr.responseText.substring(buffer.length);
+          buffer = xhr.responseText;
+          
+          const lines = newData.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const event = JSON.parse(line.substring(6));
+                if (event.type === 'progress') {
+                  // Map Telegram progress (0-100) to our 50-100 range
+                  const pct = 50 + Math.round(event.percent / 2);
+                  setFiles(prev => prev.map((f, j) => j === index ? { ...f, progress: pct } : f));
+                } else if (event.type === 'done') {
+                  setFiles(prev => prev.map((f, j) => j === index ? { ...f, status: 'done', progress: 100 } : f));
+                  resolve();
+                } else if (event.type === 'error') {
+                  reject(new Error(event.error));
+                }
+              } catch {}
+            }
+          }
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.ontimeout = () => reject(new Error('Upload timeout'));
+      xhr.timeout = 600000; // 10 min timeout for large files
+
+      xhr.send(form);
+    });
+  };
+
   const startUpload = async () => {
     setUploading(true);
-    const api = getApi(credentials);
     for (let i = 0; i < files.length; i++) {
       if (files[i].status !== 'pending') continue;
       setFiles(prev => prev.map((f, j) => j === i ? { ...f, status: 'uploading' } : f));
       try {
-        const form = new FormData();
-        form.append('file', files[i].file);
-        await api.post('/api/upload', form, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-          onUploadProgress: (e) => {
-            const pct = Math.round((e.loaded * 100) / (e.total || 1));
-            setFiles(prev => prev.map((f, j) => j === i ? { ...f, progress: pct } : f));
-          },
-        });
-        setFiles(prev => prev.map((f, j) => j === i ? { ...f, status: 'done', progress: 100 } : f));
+        const file = files[i].file;
+        if (file.size > MAX_BOT_API_SIZE && credentials.apiId && credentials.apiHash) {
+          await uploadLargeFile(file, i);
+        } else {
+          await uploadSmallFile(file, i);
+          setFiles(prev => prev.map((f, j) => j === i ? { ...f, status: 'done', progress: 100 } : f));
+        }
       } catch (err: any) {
         setFiles(prev => prev.map((f, j) => j === i ? { ...f, status: 'error', error: err.message } : f));
       }
@@ -57,6 +125,8 @@ export default function UploadModal({ onClose, onUploaded }: { onClose: () => vo
 
   const done = files.filter(f => f.status === 'done').length;
   const total = files.length;
+  const hasLargeFiles = files.some(f => f.file.size > MAX_BOT_API_SIZE);
+  const missingPyrogram = hasLargeFiles && (!credentials.apiId || !credentials.apiHash);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 backdrop-blur-sm">
@@ -86,16 +156,32 @@ export default function UploadModal({ onClose, onUploaded }: { onClose: () => vo
           />
         </div>
 
+        {missingPyrogram && (
+          <div className="mx-4 mt-3 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
+            <p className="text-xs text-destructive">
+              ⚠️ 50MB+ ফাইল আপলোড করতে API ID ও API Hash দরকার। Settings থেকে যোগ করুন।
+            </p>
+          </div>
+        )}
+
         {files.length > 0 && (
           <div className="max-h-60 overflow-auto p-4 space-y-2">
             {total > 1 && <p className="text-xs text-muted-foreground mb-2">{done}/{total} uploaded</p>}
             {files.map((f, i) => (
               <div key={i} className="flex items-center gap-3 text-sm">
                 {f.file.type.startsWith('video') ? <FileVideo className="w-4 h-4 text-muted-foreground shrink-0" /> : <FileImage className="w-4 h-4 text-muted-foreground shrink-0" />}
-                <span className="truncate flex-1 text-foreground">{f.file.name}</span>
+                <span className="truncate flex-1 text-foreground">
+                  {f.file.name}
+                  {f.file.size > MAX_BOT_API_SIZE && (
+                    <span className="ml-1 text-xs text-primary">(Pyrogram)</span>
+                  )}
+                </span>
                 {f.status === 'uploading' && (
-                  <div className="w-20 h-1.5 bg-secondary rounded-full overflow-hidden">
-                    <div className="h-full bg-primary rounded-full transition-all" style={{ width: `${f.progress}%` }} />
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground w-8 text-right">{f.progress}%</span>
+                    <div className="w-20 h-1.5 bg-secondary rounded-full overflow-hidden">
+                      <div className="h-full bg-primary rounded-full transition-all" style={{ width: `${f.progress}%` }} />
+                    </div>
                   </div>
                 )}
                 {f.status === 'done' && <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />}
@@ -109,7 +195,7 @@ export default function UploadModal({ onClose, onUploaded }: { onClose: () => vo
           <button onClick={onClose} className="tg-btn-outline text-sm">Cancel</button>
           <button
             onClick={startUpload}
-            disabled={files.length === 0 || uploading}
+            disabled={files.length === 0 || uploading || missingPyrogram}
             className="tg-btn-primary text-sm disabled:opacity-50"
           >
             {uploading ? `Uploading ${done}/${total}...` : `Upload ${total} file${total !== 1 ? 's' : ''}`}

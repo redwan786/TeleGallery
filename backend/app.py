@@ -7,10 +7,14 @@ Deploy on Render as a Web Service.
 import os
 import tempfile
 import json
+import asyncio
+import queue
+import threading
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from supabase import create_client
 from telegram_uploader import TelegramUploader
+from pyrogram_uploader import PyrogramUploader
 
 app = Flask(__name__)
 CORS(app)
@@ -25,6 +29,8 @@ def get_headers():
         'channel_id': request.headers.get('X-Channel-Id', ''),
         'supabase_url': request.headers.get('X-Supabase-Url', ''),
         'supabase_key': request.headers.get('X-Supabase-Key', ''),
+        'api_id': request.headers.get('X-Api-Id', ''),
+        'api_hash': request.headers.get('X-Api-Hash', ''),
     }
 
 
@@ -36,12 +42,6 @@ def get_supabase(creds):
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
-
-
-# ─── Root ───────────────────────────────────────────
-@app.route('/')
-def root():
-    return "TeleGallery Backend Running 🚀"
 
 
 # ─── Test Connections ─────────────────────────────────
@@ -159,6 +159,122 @@ def upload_file():
         os.unlink(tmp.name)
 
 
+# ─── Large File Upload (Pyrogram + SSE) ──────────────
+@app.route('/api/upload/large', methods=['POST'])
+def upload_large_file():
+    """Upload files > 50MB via Pyrogram with SSE progress streaming."""
+    creds = get_headers()
+
+    if not creds.get('api_id') or not creds.get('api_hash'):
+        return jsonify({'error': 'API ID and API Hash required for large file uploads'}), 400
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['file']
+    album = request.form.get('album', 'All Photos')
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='_' + file.filename)
+    file.save(tmp.name)
+    tmp.close()
+
+    file_size = os.path.getsize(tmp.name)
+    mime = file.content_type or ''
+    file_type = 'video' if mime.startswith('video') else 'photo'
+    original_filename = file.filename
+
+    progress_queue = queue.Queue()
+
+    def run_pyrogram_upload():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            uploader = PyrogramUploader(
+                api_id=creds['api_id'],
+                api_hash=creds['api_hash'],
+                bot_token=creds['bot_token'],
+            )
+
+            def on_progress(current, total):
+                pct = round((current / total) * 100)
+                progress_queue.put(('progress', pct))
+
+            result = loop.run_until_complete(
+                uploader.send_file(
+                    chat_id=creds['channel_id'],
+                    file_path=tmp.name,
+                    file_type=file_type,
+                    progress_callback=on_progress,
+                )
+            )
+            loop.run_until_complete(uploader.disconnect())
+
+            doc = result.get('document') or {}
+            file_id = doc.get('file_id', '')
+            thumbnail_id = ''
+            width = 0
+            height = 0
+
+            thumb = doc.get('thumbnail')
+            if thumb:
+                thumbnail_id = thumb.get('file_id', '')
+
+            photo_data = result.get('photo')
+            if photo_data:
+                if not thumbnail_id and photo_data.get('thumbs'):
+                    thumbnail_id = photo_data['thumbs'][0].get('file_id', '')
+                width = photo_data.get('width', 0)
+                height = photo_data.get('height', 0)
+
+            sb = get_supabase(creds)
+            row = {
+                'file_id': file_id,
+                'file_type': file_type,
+                'file_name': original_filename,
+                'file_size': file_size,
+                'mime_type': mime,
+                'album': album,
+                'thumbnail_id': thumbnail_id,
+                'width': width,
+                'height': height,
+                'duration': 0,
+            }
+            sb.table('photos').insert(row).execute()
+            progress_queue.put(('done', {'ok': True, 'file_id': file_id, 'row': row}))
+
+        except Exception as e:
+            progress_queue.put(('error', str(e)))
+        finally:
+            os.unlink(tmp.name)
+
+    thread = threading.Thread(target=run_pyrogram_upload, daemon=True)
+    thread.start()
+
+    def generate_sse():
+        while True:
+            try:
+                event_type, data = progress_queue.get(timeout=600)
+                if event_type == 'progress':
+                    yield f"data: {json.dumps({'type': 'progress', 'percent': data})}\n\n"
+                elif event_type == 'done':
+                    yield f"data: {json.dumps({'type': 'done', **data})}\n\n"
+                    break
+                elif event_type == 'error':
+                    yield f"data: {json.dumps({'type': 'error', 'error': data})}\n\n"
+                    break
+            except queue.Empty:
+                yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+
+    return Response(
+        stream_with_context(generate_sse()),
+        content_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
 # ─── Photos List ──────────────────────────────────────
 @app.route('/api/photos', methods=['GET'])
 def list_photos():
@@ -212,8 +328,15 @@ def search_photos():
 @app.route('/api/file/<file_id>', methods=['GET'])
 def stream_file(file_id):
     creds = get_headers()
-    uploader = TelegramUploader(creds['bot_token'])
 
+    # Check if large file download requested (Pyrogram)
+    use_pyrogram = request.args.get('pyrogram') == 'true'
+
+    if use_pyrogram and creds.get('api_id') and creds.get('api_hash'):
+        return _stream_file_pyrogram(file_id, creds)
+
+    # Default: Bot API (works for files ≤ 20MB)
+    uploader = TelegramUploader(creds['bot_token'])
     try:
         file_url = uploader.get_file_url(file_id)
         import requests as req
@@ -231,6 +354,58 @@ def stream_file(file_id):
             headers={'Cache-Control': 'public, max-age=86400'},
         )
     except Exception as e:
+        # If Bot API fails (likely >20MB), try Pyrogram fallback
+        if creds.get('api_id') and creds.get('api_hash'):
+            return _stream_file_pyrogram(file_id, creds)
+        return jsonify({'error': str(e)}), 500
+
+
+def _stream_file_pyrogram(file_id, creds):
+    """Download and stream a file via Pyrogram MTProto (supports up to 2GB)."""
+    import mimetypes
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix='tg_dl_')
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        uploader = PyrogramUploader(
+            api_id=creds['api_id'],
+            api_hash=creds['api_hash'],
+            bot_token=creds['bot_token'],
+        )
+
+        loop.run_until_complete(uploader.download_file(file_id, tmp_path))
+        loop.run_until_complete(uploader.disconnect())
+
+        file_size = os.path.getsize(tmp_path)
+        content_type = mimetypes.guess_type(tmp_path)[0] or 'application/octet-stream'
+
+        def generate():
+            try:
+                with open(tmp_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)  # 64KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                os.unlink(tmp_path)
+
+        return Response(
+            stream_with_context(generate()),
+            content_type=content_type,
+            headers={
+                'Cache-Control': 'public, max-age=86400',
+                'Content-Length': str(file_size),
+            },
+        )
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         return jsonify({'error': str(e)}), 500
 
 

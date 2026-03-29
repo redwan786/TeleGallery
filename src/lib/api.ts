@@ -12,9 +12,22 @@ export function getApi(creds: Credentials): AxiosInstance {
       'X-Channel-Id': creds.channelId,
       'X-Supabase-Url': creds.supabaseUrl,
       'X-Supabase-Key': creds.supabaseAnonKey,
+      'X-Api-Id': creds.apiId || '',
+      'X-Api-Hash': creds.apiHash || '',
     },
   });
   return instance;
+}
+
+export function getApiHeaders(creds: Credentials): Record<string, string> {
+  return {
+    'X-Bot-Token': creds.botToken,
+    'X-Channel-Id': creds.channelId,
+    'X-Supabase-Url': creds.supabaseUrl,
+    'X-Supabase-Key': creds.supabaseAnonKey,
+    'X-Api-Id': creds.apiId || '',
+    'X-Api-Hash': creds.apiHash || '',
+  };
 }
 
 export function resetApi() {
